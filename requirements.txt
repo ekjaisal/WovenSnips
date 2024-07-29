@@ -1,0 +1,9 @@
+faiss-cpu==1.8.0.post1
+langchain==0.2.11
+langchain-community==0.2.10
+langchain-huggingface==0.0.3
+pdfplumber==0.11.2
+pydantic==2.8.2
+PySide6==6.7.2
+requests==2.32.3
+torch==2.3.0
