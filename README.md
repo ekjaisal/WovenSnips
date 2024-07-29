@@ -21,12 +21,13 @@ WovenSnips is a lightweight, free, and open-source implementation of Retrieval-A
 ## Usage 💻
 
 1. Download the latest release from the [Releases](https://github.com/ekjaisal/WovenSnips/releases) page.
-2. Set up WovenSnips on your device using the installer.
+2. Set up WovenSnips on the local device using the installer (currently available only for Windows).
 3. Point and click to launch the application.
-4. Set up your Straico API Key and select a language model from Settings.
-5. Load your corpus from **File → Load Corpus**, or load a previously saved vector store from **File → Load Vector Store**.
-6. Start interacting with your corpus through the chat interface.
-7. Save your vector store for future use from **File → Save Vector Store** to avoid reprocessing large corpora.
+4. Select the preferred model to interact with from **Settings → Set Model**.
+5. Set the Straico API Key from **Settings → Set API Key**. Existing Straico users can find their API Key from the platform's settings page. New users may choose to create a Straico account using this [referral link](https://platform.straico.com/signup?fpr=jaisal).
+6. Load the collection of files to be used as source material for RAG from **File → Load Corpus → Select Corpus Directory**, or load a previously saved vector store from **File → Load Vector Store**.
+7. Start interacting with the corpus through the chat interface.
+8. Save the loaded corpus as a vector store for future reuse from **File → Save Vector Store** to avoid reprocessing large corpora.
 
 ## Third-Party Libraries and Services 🛠️
 
