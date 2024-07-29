@@ -1,0 +1,5 @@
+theme: jekyll-theme-minimal
+title: ""
+description: "WovenSnips: A Lightweight, Free, and Open-source Implementation of Retrieval-Augmented Generation (RAG) using Straico API"
+logo: /WovenSnips.ico
+show_downloads: true
