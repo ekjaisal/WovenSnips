@@ -1,5 +1,5 @@
 # WovenSnips
-[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD_3--Clause-141414.svg)](https://github.com/ekjaisal/WovenSnips/blob/main/LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/ekjaisal/WovenSnips?color=141414&label=Release)](https://github.com/ekjaisal/WovenSnips/releases) [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD_3--Clause-141414.svg)](https://github.com/ekjaisal/WovenSnips/blob/main/LICENSE)
 
 WovenSnips is a lightweight, free, and open-source implementation of Retrieval-Augmented Generation (RAG) using the [Straico API](https://straico.com/). It provides a simple and clean Graphical User Interface (GUI) for users to load corpora to perform RAG-based explorations of the corpus, mediating the interactions through various language models.
 
@@ -16,7 +16,7 @@ WovenSnips is a lightweight, free, and open-source implementation of Retrieval-A
 <div style="display: flex; justify-content: space-between;">
   <img src="assets/screenshots/interface_light.jpg" alt="WovenSnips Main Interface - Light Theme" style="width: 49%;" />
   <img src="assets/screenshots/interface_dark.jpg" alt="WovenSnips Main Interface - Dark Theme" style="width: 49%;" />
-</div>
+</div></br>
 
 ## Usage 💻
 
