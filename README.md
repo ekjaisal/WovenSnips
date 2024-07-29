@@ -13,8 +13,10 @@ WovenSnips is a lightweight, free, and open-source implementation of Retrieval-A
 - 💬 Minimal, user-friendly interface for clutter-free, focused engagement with the loaded corpus.
 - 🌓 Dark and light theme options.
 
-| ![WovenSnips Main Interface - Light Theme](assets/screenshots/interface_light.jpg) | ![WovenSnips Main Interface - Dark Theme](assets/screenshots/interface_dark.jpg) |
-|:---:|:---:|
+<div style="display: flex; justify-content: space-between;">
+  <img src="assets/screenshots/interface_light.jpg" alt="WovenSnips Main Interface - Light Theme" style="width: 49%;" />
+  <img src="assets/screenshots/interface_dark.jpg" alt="WovenSnips Main Interface - Dark Theme" style="width: 49%;" />
+</div>
 
 ## Usage 💻
 
