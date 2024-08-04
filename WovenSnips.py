@@ -32,21 +32,26 @@ import sys
 import json
 import pickle
 import logging
-import pdfplumber
+import threading
+from functools import lru_cache
+from urllib.parse import (urlparse, parse_qs)
+from http.server import (HTTPServer, BaseHTTPRequestHandler)
+from concurrent.futures import (ThreadPoolExecutor, as_completed)
+from typing import (Optional, List, Any)
+
 import requests
 import torch
-from functools import lru_cache
+import pdfplumber
 from pydantic import Field
 from langchain.llms.base import LLM
 from langchain.chains import RetrievalQA
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from concurrent.futures import (ThreadPoolExecutor, as_completed)
-from typing import (Optional, List, Any)
-from PySide6.QtCore import (Qt, QThread, Signal, QSize, QRect, QPoint, QTimer, QRectF)
+
+from PySide6.QtCore import (Qt, Signal, QTimer, QRectF)
 from PySide6.QtGui import (QIcon, QFont, QColor, QPalette, QPainter, QPainterPath, QFontDatabase, QPen, QAction)
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QTextEdit, QLabel, QFileDialog, QDialog, QComboBox, QMessageBox, QInputDialog, QScrollArea, QMenu, QDialogButtonBox, QTextBrowser)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QLabel, QFileDialog, QDialog, QComboBox, QMessageBox, QInputDialog, QScrollArea, QMenu, QDialogButtonBox, QTextBrowser)
 
 LIGHT_THEME = {
     QPalette.Window: "#f5f3ef",
@@ -137,12 +142,10 @@ def extract_text_from_file(file_path):
         logger.error(f"Error extracting text from {file_path}: {e}")
         return None
 
-def process_files_in_batches(directory, batch_size=50, progress_callback=None):
+def process_files_in_batches(directory, batch_size=50):
     supported_extensions = ['.pdf', '.txt', '.md', '.csv']
     all_files = [f for f in os.listdir(directory) if os.path.splitext(f)[1].lower() in supported_extensions]
-    total_files = len(all_files)
     documents = []
-    processed_files = 0
     
     with ThreadPoolExecutor() as executor:
         future_to_file = {executor.submit(extract_text_from_file, os.path.join(directory, file)): file for file in all_files}
@@ -150,15 +153,12 @@ def process_files_in_batches(directory, batch_size=50, progress_callback=None):
             result = future.result()
             if result:
                 documents.append(result)
-            processed_files += 1
-            if progress_callback:
-                progress_callback(int((processed_files / total_files) * 100))
     
     return documents
 
-def create_rag_system(directory, api_key, model, batch_size=50, progress_callback=None):
-    documents = process_files_in_batches(directory, batch_size, progress_callback)
-        
+def create_rag_system(directory, api_key, model):
+    documents = process_files_in_batches(directory)
+    
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     
     embeddings = HuggingFaceEmbeddings(
@@ -190,23 +190,20 @@ def create_rag_system(directory, api_key, model, batch_size=50, progress_callbac
     
     return qa_chain, straico_llm, retriever
 
-class DocumentLoader(QThread):
-    progress = Signal(int)
-    finished = Signal(object)
-    error = Signal(str)
-
+class DocumentLoader(threading.Thread):
     def __init__(self, directory, api_key, model):
         super().__init__()
         self.directory = directory
         self.api_key = api_key
         self.model = model
+        self.result = None
+        self.error = None
 
     def run(self):
         try:
-            qa_system = create_rag_system(self.directory, self.api_key, self.model, progress_callback=self.progress.emit)
-            self.finished.emit(qa_system)
+            self.result = create_rag_system(self.directory, self.api_key, self.model)
         except Exception as e:
-            self.error.emit(str(e))
+            self.error = str(e)
 
 class SpinningLoader(QWidget):
     def __init__(self, parent=None):
@@ -241,54 +238,50 @@ class SpinningLoader(QWidget):
         self.timer.stop()
         self.hide()
 
-class ChatWorker(QThread):
-    finished = Signal(str)
-    error = Signal(str)
-
+class ChatWorker(threading.Thread):
     def __init__(self, qa_system, query):
         super().__init__()
         self.qa_system = qa_system
         self.query = query
+        self.result = None
+        self.error = None
 
     def run(self):
         try:
             response = self.qa_system.invoke({"query": self.query})
-            self.finished.emit(response["result"])
+            self.result = response["result"]
         except Exception as e:
-            self.error.emit(str(e))
+            self.error = str(e)
 
-class SaveVectorStoreWorker(QThread):
-    finished = Signal(bool)
-    error = Signal(str)
-
+class SaveVectorStoreWorker(threading.Thread):
     def __init__(self, retriever, file_path):
         super().__init__()
         self.retriever = retriever
         self.file_path = file_path
+        self.success = False
+        self.error = None
 
     def run(self):
         try:
             with open(self.file_path, 'wb') as f:
                 pickle.dump(self.retriever.vectorstore, f)
-            self.finished.emit(True)
+            self.success = True
         except Exception as e:
-            self.error.emit(str(e))
+            self.error = str(e)
 
-class LoadVectorStoreWorker(QThread):
-    finished = Signal(object)
-    error = Signal(str)
-
+class LoadVectorStoreWorker(threading.Thread):
     def __init__(self, file_path):
         super().__init__()
         self.file_path = file_path
+        self.result = None
+        self.error = None
 
     def run(self):
         try:
             with open(self.file_path, 'rb') as f:
-                vectorstore = pickle.load(f)
-            self.finished.emit(vectorstore)
+                self.result = pickle.load(f)
         except Exception as e:
-            self.error.emit(str(e))
+            self.error = str(e)
 
 class ChatBubble(QWidget):
     def __init__(self, text, is_user, parent=None):
@@ -353,6 +346,8 @@ class ChatBubble(QWidget):
 
 class ChatWidget(QWidget):
     def __init__(self, parent=None):
+        if parent is None:
+            parent = QApplication.instance().activeWindow()
         super().__init__(parent)
         self.layout = QVBoxLayout(self)
         self.layout.setSpacing(10)
@@ -368,7 +363,82 @@ class ChatWidget(QWidget):
             scrollbar = self.parent().verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
 
+class WovenSnipsLocalServer:
+    def __init__(self, woven_snips_instance, port=60606):
+        self.woven_snips = woven_snips_instance
+        self.port = port
+        self.server = None
+        self.server_thread = None
+
+    def start(self):
+        if self.server:
+            return
+
+        class ThreadedHTTPServer(HTTPServer):
+            def __init__(self, *args, **kwargs):
+                self.woven_snips = None
+                super().__init__(*args, **kwargs)
+
+        class ChatHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    query = urlparse(self.path).query
+                    params = parse_qs(query)
+
+                    if 'p' in params:
+                        prompt = params['p'][0]
+                        
+                        if prompt.startswith("load_corpus:"):
+                            directory = prompt[12:].strip()
+                            response = self.server.woven_snips.load_corpus_local_server(directory)
+                        elif prompt.startswith("load_vs:"):
+                            vector_store_path = prompt[8:].strip()
+                            response = self.server.woven_snips.load_vector_store_local_server(vector_store_path)
+                        elif prompt.startswith("save_vs:"):
+                            vector_store_path = prompt[8:].strip()
+                            response = self.server.woven_snips.save_vector_store_local_server(vector_store_path)
+                        elif prompt == "list_models":
+                            response = self.server.woven_snips.list_models_local_server()
+                        elif prompt.startswith("select_model:"):
+                            model_name = prompt[13:].strip()
+                            response = self.server.woven_snips.select_model_local_server(model_name)
+                        elif prompt == "clear_session":
+                            response = self.server.woven_snips.clear_session_local_server()
+                        else:
+                            response = self.server.woven_snips.process_chat(prompt)                        
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(response.encode())
+                    else:
+                        self.send_error(400, 'Missing "prompt" parameter')
+                except Exception as e:
+                    self.send_error(500, str(e))
+            
+            def log_message(self, format, *args):
+                pass
+
+        server_address = ('', self.port)
+        self.server = ThreadedHTTPServer(server_address, ChatHandler)
+        self.server.woven_snips = self.woven_snips
+        self.server_thread = threading.Thread(target=self.server.serve_forever)
+        self.server_thread.daemon = True
+        self.server_thread.start()
+        print(f"Server started on http://localhost:{self.port}/")
+
+    def stop(self):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server = None
+            self.server_thread = None
+            print("Server stopped")
+
+    def is_running(self):
+        return self.server is not None
+
 class WovenSnipsGUI(QMainWindow):
+    clear_session_signal = Signal()
     def __init__(self):
         super().__init__()
         self.setWindowTitle("WovenSnips")
@@ -376,15 +446,20 @@ class WovenSnipsGUI(QMainWindow):
         self.setWindowIcon(QIcon(icon_path))
         self.resize(400, 600)
         self.current_theme = LIGHT_THEME
+        self.available_models = []
+        self.qa_system = None
+        self.straico_llm = None
+        self.retriever = None
+        self.local_server = WovenSnipsLocalServer(self)
+        
         self.setup_ui()
         self.setup_menubar()
         self.load_settings()
         self.apply_theme(self.current_theme)
         self.set_roboto_font()
-        self.qa_system = None
-        self.straico_llm = None
-        self.retriever = None
-        self.update_clear_session_action()
+        self.update_models()
+        self.update_server_status_indicator()
+        self.clear_session_signal.connect(self.clear_session_gui)
 
     def setup_ui(self):
         central_widget = QWidget(self)
@@ -415,6 +490,15 @@ class WovenSnipsGUI(QMainWindow):
         self.send_button.clicked.connect(self.send_message)
         self.chat_input.returnPressed.connect(self.send_message)
         chat_input_layout.addWidget(self.send_button)
+        
+        self.server_status_indicator = QLabel()
+        self.server_status_indicator.setFixedSize(10, 10)
+        self.server_status_indicator.setStyleSheet("background-color: #949494; border-radius: 6px;")
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(QLabel("Local Server Status:"))
+        status_layout.addWidget(self.server_status_indicator)
+        status_layout.addStretch()
+        layout.addLayout(status_layout)
 
         layout.addLayout(chat_input_layout)
         self.set_roboto_font()
@@ -437,8 +521,7 @@ class WovenSnipsGUI(QMainWindow):
         file_menu.addAction(load_pkl_action)
         
         self.clear_session_action = QAction("Clear Session", self)
-        self.clear_session_action.triggered.connect(self.clear_session)
-        self.clear_session_action.setEnabled(False)
+        self.clear_session_action.triggered.connect(self.clear_session_gui)
         file_menu.addAction(self.clear_session_action)
 
         settings_menu = menubar.addMenu("Settings")
@@ -446,7 +529,7 @@ class WovenSnipsGUI(QMainWindow):
         api_key_action.triggered.connect(self.set_api_key)
         settings_menu.addAction(api_key_action)
 
-        model_action = QAction("Set Model", self)
+        model_action = QAction("Select Model", self)
         model_action.triggered.connect(self.set_model)
         settings_menu.addAction(model_action)
 
@@ -463,6 +546,11 @@ class WovenSnipsGUI(QMainWindow):
         self.theme_action.setCheckable(True)
         self.theme_action.triggered.connect(self.toggle_theme)
         settings_menu.addAction(self.theme_action)
+        
+        self.server_action = QAction("Local Server", self)
+        self.server_action.setCheckable(True)
+        self.server_action.triggered.connect(self.toggle_local_server)
+        settings_menu.addAction(self.server_action)
 
     def load_documents(self):
         if not self.check_initial_setup():
@@ -472,21 +560,29 @@ class WovenSnipsGUI(QMainWindow):
         if directory:
             self.loader_widget.start()
             self.loader = DocumentLoader(directory, self.api_key, self.model)
-            self.loader.finished.connect(self.on_documents_loaded)
-            self.loader.error.connect(self.on_loading_error)
             self.loader.start()
+            self.check_loader_thread()
+
+    def check_loader_thread(self):
+        if self.loader.is_alive():
+            QTimer.singleShot(100, self.check_loader_thread)
+        else:
+            self.loader_widget.stop()
+            if self.loader.error:
+                self.on_loading_error(self.loader.error)
+            else:
+                self.on_documents_loaded(self.loader.result)
 
     def on_documents_loaded(self, result):
         self.qa_system, self.straico_llm, self.retriever = result
         self.loader_widget.stop()
-        self.chat_widget.add_message("Corpus loaded successfully!", False)
+        self.chat_widget.add_message("Corpus loaded successfully.", False)
         
         reply = QMessageBox.question(self, 'Save Vector Store', 
                                      "Do you want to save the vector store for future use?",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if reply == QMessageBox.Yes:
             self.save_vector_store()
-        self.update_clear_session_action()
 
     def on_loading_error(self, error):
         self.loader_widget.stop()
@@ -494,20 +590,28 @@ class WovenSnipsGUI(QMainWindow):
         
     def save_vector_store(self):
         if not self.retriever:
-            QMessageBox.warning(self, "Error", "No vector store to save. Please load a corpus or vector store first!")
+            QMessageBox.warning(self, "Error", "No vector store to save. Please load a corpus or vector store first.")
             return
 
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Vector Store", "", "Pickle Files (*.pkl)")
         if file_path:
             self.loader_widget.start()
             self.save_worker = SaveVectorStoreWorker(self.retriever, file_path)
-            self.save_worker.finished.connect(self.on_vector_store_saved)
-            self.save_worker.error.connect(self.on_vector_store_save_error)
             self.save_worker.start()
+            self.check_save_thread()
+            
+    def check_save_thread(self):
+        if self.save_worker.is_alive():
+            QTimer.singleShot(100, self.check_save_thread)
+        else:
+            if self.save_worker.error:
+                self.on_vector_store_save_error(self.save_worker.error)
+            else:
+                self.on_vector_store_saved()
 
     def on_vector_store_saved(self):
         self.loader_widget.stop()
-        self.chat_widget.add_message("Vector store saved successfully!", False)
+        self.chat_widget.add_message("Vector store saved successfully.", False)
         
     def on_vector_store_save_error(self, error):
         self.loader_widget.stop()
@@ -518,42 +622,49 @@ class WovenSnipsGUI(QMainWindow):
         if file_path:
             self.loader_widget.start()
             self.load_worker = LoadVectorStoreWorker(file_path)
-            self.load_worker.finished.connect(self.on_vector_store_loaded)
-            self.load_worker.error.connect(self.on_vector_store_load_error)
             self.load_worker.start()
+            self.check_load_thread()
+            
+    def check_load_thread(self):
+        if self.load_worker.is_alive():
+            QTimer.singleShot(100, self.check_load_thread)
+        else:
+            if self.load_worker.error:
+                self.on_vector_store_load_error(self.load_worker.error)
+            else:
+                self.on_vector_store_loaded(self.load_worker.result)
             
     def on_vector_store_loaded(self, vectorstore):
         self.loader_widget.stop()
         self.retriever = vectorstore.as_retriever(search_kwargs={"k": 3, "fetch_k": 5})
         self.recreate_qa_system()
-        self.chat_widget.add_message("Vector store loaded successfully!", False)
-        self.update_clear_session_action()
+        self.chat_widget.add_message("Vector store loaded successfully.", False)
 
     def on_vector_store_load_error(self, error):
         self.loader_widget.stop()
         self.chat_widget.add_message(f"Error: Failed to load vector store - {error}", False)
 
     def clear_session(self):
-        reply = QMessageBox.question(self, 'Clear Session', 
-                                     "Are you sure you want to clear the current session?",
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        
-        if reply == QMessageBox.Yes:
-            self.chat_widget.layout.removeWidget(self.chat_widget.layout.itemAt(0).widget())
-            self.chat_widget = ChatWidget()
-            self.chat_scroll.setWidget(self.chat_widget)
+        if self.qa_system or self.retriever or self.chat_widget.layout.count() > 1:
             self.qa_system = None
             self.straico_llm = None
             self.retriever = None
-            self.vector_store_saved_message_shown = False
-            self.chat_input.clear()
-            self.chat_widget.add_message("Session cleared!", False)
-        self.update_clear_session_action()
-            
-    def update_clear_session_action(self):
-        has_session = bool(self.qa_system or self.retriever or self.chat_widget.layout.count() > 1)
-        self.clear_session_action.setEnabled(has_session)
+            return json.dumps({"response": "Session cleared.", "status": 200})
+        else:
+            return json.dumps({"response": "No active session to clear.", "status": 200})
 
+    def clear_session_gui(self):
+        if self.qa_system or self.retriever or self.chat_widget.layout.count() > 1:
+            self.qa_system = None
+            self.straico_llm = None
+            self.retriever = None
+            self.chat_widget = ChatWidget()
+            self.chat_scroll.setWidget(self.chat_widget)
+            self.chat_input.clear()
+            self.chat_widget.add_message("Session cleared.", False)
+        else:
+            QMessageBox.information(self, "No Active Session", "No active session to clear.")
+            
     def set_api_key(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Set API Key")
@@ -583,7 +694,7 @@ class WovenSnipsGUI(QMainWindow):
                 self.save_settings()
                 QMessageBox.information(self, "API Key Updated", "API Key has been updated successfully.")
             elif not self.api_key:
-                QMessageBox.warning(self, "No API Key", "Please enter an API Key.")
+                QMessageBox.warning(self, "No API Key", "Please enter your Straico API Key.")
         if self.straico_llm:
             self.straico_llm.update_credentials(self.api_key, self.model)
 
@@ -592,38 +703,200 @@ class WovenSnipsGUI(QMainWindow):
         self.save_settings()
         dialog.close()
         QMessageBox.information(self, "API Key Removed", "API Key has been removed.")
+        
+    def toggle_local_server(self):
+        try:
+            if self.local_server.is_running():
+                self.local_server.stop()
+                QMessageBox.information(self, "Server Status", "Local server stopped.")
+            else:
+                self.local_server.start()
+                QMessageBox.information(self, "Local Server Status", "Local server started successfully.")
+            self.server_action.setChecked(self.local_server.is_running())
+            self.save_settings()
+            self.update_server_status_indicator()
+        except Exception as e:
+            QMessageBox.warning(self, "Server Error", f"An error occurred: {str(e)}")
+            
+    def update_server_status_indicator(self):
+        if self.local_server.is_running():
+            self.server_status_indicator.setStyleSheet("background-color: #A580AD; border-radius: 6px;")
+            self.server_status_indicator.setToolTip("Local server is running")
+        else:
+            self.server_status_indicator.setStyleSheet("background-color: #949494; border-radius: 6px;")
+            self.server_status_indicator.setToolTip("Local server is not running")
+
+    def process_chat(self, prompt):
+        if not self.api_key:
+            return json.dumps({"response": "Error: API Key is not set. Please set the API Key in the application settings.", "status": 401})
+
+        if prompt.startswith("load_corpus:"):
+            directory = prompt[12:].strip()
+            return self.load_corpus_local_server(directory)
+        elif prompt.startswith("load_vs:"):
+            vector_store_path = prompt[8:].strip()
+            return self.load_vector_store_local_server(vector_store_path)
+        elif prompt.startswith("save_vs:"):
+            vector_store_path = prompt[8:].strip()
+            return self.save_vector_store_local_server(vector_store_path)
+        elif prompt == "list_models":
+            return self.list_models_local_server()
+        elif prompt.startswith("select_model:"):
+            model_name = prompt[13:].strip()
+            return self.select_model_local_server(model_name)
+        elif prompt == "clear_session":
+            return self.clear_session_local_server()
+
+        if not self.qa_system and not self.retriever:
+            return json.dumps({"response": "Error: Please load a corpus or vector store to proceed.", "status": 400})
+
+        if not self.qa_system:
+            self.recreate_qa_system()
+
+        try:
+            response = self.qa_system.invoke({"query": prompt})
+            return json.dumps({"response": response["result"], "status": 200})
+        except Exception as e:
+            return json.dumps({"response": f"Error: {str(e)}", "status": 400})
+
+    def load_corpus_local_server(self, directory):
+        if not self.api_key:
+            return json.dumps({"response": "Error: API Key is not set. Please set the API Key in the application settings.", "status": 401})
+
+        if not os.path.exists(directory):
+            return json.dumps({"response": f"Error: Directory not found - {directory}", "status": 400})
+
+        try:
+            qa_system, straico_llm, retriever = create_rag_system(directory, self.api_key, self.model)
+            self.qa_system, self.straico_llm, self.retriever = qa_system, straico_llm, retriever
+            return json.dumps({"response": f"Corpus loaded successfully from {directory}", "status": 200})
+        except Exception as e:
+            return json.dumps({"response": f"Error loading corpus: {str(e)}", "status": 400})
+
+    def load_vector_store_local_server(self, file_path):
+        if not self.api_key:
+            return json.dumps({"response": "Error: API Key is not set. Please set the API Key in the application settings.", "status": 401})
+
+        if not os.path.exists(file_path):
+            return json.dumps({"response": f"Error: File not found - {file_path}", "status": 400})
+
+        try:
+            with open(file_path, 'rb') as f:
+                vectorstore = pickle.load(f)
+            self.retriever = vectorstore.as_retriever(search_kwargs={"k": 3, "fetch_k": 5})
+            self.recreate_qa_system()
+            return json.dumps({"response": f"Vector store loaded successfully from {file_path}", "status": 200})
+        except Exception as e:
+            return json.dumps({"response": f"Error loading vector store: {str(e)}", "status": 400})
+            
+    def save_vector_store_local_server(self, file_path):
+        if not self.api_key:
+            return json.dumps({"response": "Error: API Key is not set. Please set the API Key in the application settings.", "status": 401})
+
+        if not self.retriever:
+            return json.dumps({"response": "Error: No vector store to save. Please load a corpus or vector store first.", "status": 400})
+
+        try:
+            with open(file_path, 'wb') as f:
+                pickle.dump(self.retriever.vectorstore, f)
+            return json.dumps({"response": f"Vector store saved to {file_path}", "status": 200})
+        except Exception as e:
+            return json.dumps({"response": f"Error saving vector store: {str(e)}", "status": 400})
+            
+    def list_models_local_server(self):
+        if not self.api_key:
+            return json.dumps({"response": "Error: API Key is not set. Please set the API Key in the application settings.", "status": 401})
+
+        if not self.available_models:
+            self.update_models()
+
+        if not self.available_models:
+            return json.dumps({"response": "Error: Unable to fetch the list of available models. Please ensure that the API Key is correct or check the internet connection.", "status": 400})
+
+        model_list = [{"name": model[1], "model": model[0], "coins": model[2]} for model in self.available_models]
+        return json.dumps({"data": model_list, "status": 200})
+
+    def select_model_local_server(self, model_name):
+        if not self.api_key:
+            return json.dumps({"response": "Error: API Key is not set. Please set the API Key in the application settings.", "status": 401})
+
+        if not self.available_models:
+            self.update_models()
+
+        if not any(model_name == model[0] for model in self.available_models):
+            return json.dumps({"response": f"Error: '{model_name}' is not a valid model. Please choose from the list of valid models.", "status": 400})
+
+        self.model = model_name
+        self.save_settings()
+        if self.straico_llm:
+            self.straico_llm.update_credentials(self.api_key, self.model)
+        if self.qa_system:
+            self.recreate_qa_system()
+        return json.dumps({"response": f"Model set to: {model_name}", "status": 200})
+            
+    def clear_session_local_server(self):
+        if not self.qa_system and not self.retriever:
+            return json.dumps({"response": "No active session to clear.", "status": 400})
+
+        try:
+            self.qa_system = None
+            self.straico_llm = None
+            self.retriever = None
+            return json.dumps({"response": "Session cleared.", "status": 200})
+        except Exception as e:
+            return json.dumps({"response": f"Error clearing session: {str(e)}", "status": 400})
+            
+    def closeEvent(self, event):
+        if self.local_server.is_running():
+            self.local_server.stop()
+        super().closeEvent(event)
+
+    def fetch_models_from_api(self):
+        url = "https://api.straico.com/v1/models"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            chat_models = data.get('data', {}).get('chat', [])
+            return [(model['model'], model['name'], model['pricing']['coins']) for model in chat_models]
+        except requests.RequestException as e:
+            logger.error(f"Error fetching models from API: {e}")
+            return None
+            
+    def update_models(self):
+        if not self.api_key:
+            logger.warning("API key not set. Unable to fetch models.")
+            return
+
+        new_models = self.fetch_models_from_api()
+        if new_models:
+            self.available_models = new_models
+            logger.info("Models updated.")
+        else:
+            logger.warning("Failed to update models.")
+            self.available_models = []
 
     def set_model(self):
-        models = [
-            ("openai/gpt-4o-mini", "OpenAI: GPT-4o mini"),
-            ("google/gemma-2-27b-it", "Google: Gemma 2 27B"),
-            ("qwen/qwen-2-72b-instruct", "Qwen 2 72B Instruct"),
-            ("deepseek/deepseek-coder", "DeepSeek Coder V2"),
-            ("meta-llama/llama-3-70b-instruct:nitro", "Meta: Llama 3 70B Instruct (Nitro)"),
-            ("anthropic/claude-3-haiku:beta", "Anthropic: Claude 3 Haiku"),
-            ("meta-llama/llama-3.1-405b-instruct", "Meta: Llama 3.1 405B Instruct"),
-            ("google/gemini-pro-1.5", "Google: Gemini Pro 1.5"),
-            ("openai/gpt-4o", "OpenAI: GPT-4o"),
-            ("anthropic/claude-3.5-sonnet", "Anthropic: Claude 3.5 Sonnet")
-        ]
-
-        current_index = 0
-        for i, (model_name, _) in enumerate(models):
-            if model_name == self.model:
-                current_index = i
-                break
-
-        current_model = next((friendly for model_name, friendly in models if model_name == self.model), "No model set")
+        if not self.available_models:
+            self.update_models()
+        
+        if not self.available_models:
+            QMessageBox.warning(self, "Error", "Unable to fetch available models. Please ensure that the API Key is in place or check the internet connection.")
+            return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Set Model")
+        dialog.setWindowTitle("Select Model")
         layout = QVBoxLayout(dialog)
+
+        current_model = next((f"{friendly} • {coins} Coin(s)" for model_name, friendly, coins in self.available_models if model_name == self.model), "No model set")
 
         current_label = QLabel(f"Current Model: {current_model}")
         layout.addWidget(current_label)
 
         combo = QComboBox()
-        combo.addItems([friendly for _, friendly in models])
+        combo.addItems([f"{friendly} • {coins} Coin(s)" for _, friendly, coins in self.available_models])
+        current_index = next((i for i, (model_name, _, _) in enumerate(self.available_models) if model_name == self.model), 0)
         combo.setCurrentIndex(current_index)
         layout.addWidget(combo)
 
@@ -634,7 +907,7 @@ class WovenSnipsGUI(QMainWindow):
 
         if dialog.exec() == QDialog.Accepted:
             new_friendly = combo.currentText()
-            self.model = next(model_name for model_name, friendly in models if friendly == new_friendly)
+            self.model = next(model_name for model_name, friendly, coins in self.available_models if f"{friendly} • {coins} Coin(s)" == new_friendly)
             self.save_settings()
             QMessageBox.information(self, "Model Updated", f"Model set to: {new_friendly}")
 
@@ -788,8 +1061,8 @@ class WovenSnipsGUI(QMainWindow):
         <h2>Getting Started with WovenSnips</h2>
         <hr />
         <h3>Initial Setup</h3>
-        <p>Select the preferred model to interact with from <strong>Settings → Set Model</strong>. This preference can be changed at any time, even while a session is in progress.</p>
         <p>Set the Straico API Key from <strong>Settings → Set API Key</strong>. Existing Straico users can find their API Key from the platform&#39;s settings page. New users may choose to create a Straico account using this <a href='https://platform.straico.com/signup?fpr=jaisal'>referral link</a>.</p>
+        <p>Select the preferred model to interact with from <strong>Settings → Select Model</strong>. This preference can be changed at any time, even while a session is in progress.</p>        
         <hr />
         <h3>Load Corpus</h3>
         <p>Load the collection of files to be used as source material for Retrieval-Augmented Generation from <strong>File → Load Corpus → Select Corpus Directory</strong>. WovenSnips currently supports files with the following extensions to be included in the corpus directory: <code>.pdf</code>, <code>.txt</code>, <code>.md</code>, <code>.csv</code></p>
@@ -804,12 +1077,16 @@ class WovenSnipsGUI(QMainWindow):
         <hr />
         <h3>Themes</h3>
         <p>WovenSnips supports light (default) and dark themes. Toggle the dark theme on/off from <strong>Settings → Dark Theme</strong>.</p>
+        <hr />
+        <h3>Local Server</h3>
+        <p>The local server allows WovenSnips to interact with other applications or scripts via HTTP requests at <code>http://localhost:60606</code>.Toggle the local server on/off from <strong>Settings → Local Server</strong>. The status indicator shows purple when the server is running and grey when inactive.</p>
+        <p><em><strong>Note:</strong> Please refer to the <a href='https://github.com/ekjaisal/WovenSnips/wiki'>Local Server Documentation</a> for details on using the local server and its endpoints, with examples.</em></p>
         """
         self.show_scrollable_html_dialog("Getting Started", tips_html)
 
     def show_about(self):
         about_html = """
-        <h2>WovenSnips <small>v1.0.0</small></h2>        
+        <h2>WovenSnips <small>v1.0.1</small></h2>        
         <p>A Lightweight, Free, and Open-source Implementation of Retrieval-Augmented Generation (RAG) using Straico API</p>
         <hr>        
         <h3>License</h3>        
@@ -858,7 +1135,7 @@ class WovenSnipsGUI(QMainWindow):
         <p>Many thanks to the developers and contributors of these libraries and services. Full documentation and license details can be found at the links provided.</p>
         <hr>
         <h3>Acknowledgements</h3>
-        <p>WovenSnips has benefitted significantly from the assistance of Anthropic's <a href="https://www.anthropic.com/news/claude-3-5-sonnet">Claude 3.5 Sonnet</a> with all the heavy lifting associated with coding.</p>
+        <p>WovenSnips has benefitted significantly from the assistance of Anthropic's <a href="https://www.anthropic.com/news/claude-3-5-sonnet">Claude 3.5 Sonnet</a> with all the heavy lifting associated with coding, <a href="https://github.com/RoboRiley">Riley</a>'s addition of local server capability, and the overwhelming warmth and support from the Straico community.</p>
         """
         self.show_scrollable_html_dialog("About WovenSnips", about_html)
 
@@ -867,7 +1144,7 @@ class WovenSnipsGUI(QMainWindow):
         if not query:
             return
         if not self.qa_system and not self.retriever:
-            QMessageBox.warning(self, "Error", "Please load a corpus or vector store to proceed!")
+            QMessageBox.warning(self, "Error", "Please load a corpus or vector store to proceed.")
             return
         if not self.api_key:
             self.prompt_for_api_key()
@@ -877,12 +1154,19 @@ class WovenSnipsGUI(QMainWindow):
             self.recreate_qa_system()
 
         self.chat_widget.add_message(query, True)
-        self.update_clear_session_action()
         self.chat_input.clear()
         self.worker = ChatWorker(self.qa_system, query)
-        self.worker.finished.connect(self.display_response)
-        self.worker.error.connect(self.display_error)
         self.worker.start()
+        self.check_chat_thread()
+        
+    def check_chat_thread(self):
+        if self.worker.is_alive():
+            QTimer.singleShot(100, self.check_chat_thread)
+        else:
+            if self.worker.error:
+                self.display_error(self.worker.error)
+            else:
+                self.display_response(self.worker.result)
         
     def prompt_for_api_key(self):
         api_key, ok = QInputDialog.getText(
@@ -904,7 +1188,6 @@ class WovenSnipsGUI(QMainWindow):
 
     def display_response(self, response):
         self.chat_widget.add_message(response, False)
-        self.update_clear_session_action()
 
     def display_error(self, error):
         self.chat_widget.add_message(f"Error: {error}", False)
@@ -925,6 +1208,12 @@ class WovenSnipsGUI(QMainWindow):
             self.model = settings.get('model', '')
             self.current_theme = DARK_THEME if settings.get('dark_theme', False) else LIGHT_THEME
             self.theme_action.setChecked(self.current_theme == DARK_THEME)
+            if settings.get('local_server', False):
+                self.local_server.start()
+                self.update_server_status_indicator()
+            if hasattr(self, 'server_action'):
+                self.server_action.setChecked(self.local_server.is_running())
+            self.update_server_status_indicator()
         else:
             self.api_key = ''
             self.model = ''
@@ -940,26 +1229,8 @@ class WovenSnipsGUI(QMainWindow):
         dialog.setWindowTitle("Initial Setup")
         layout = QVBoxLayout(dialog)
 
-        layout.addWidget(QLabel("Welcome to WovenSnips! Please set up your preferences:"))
-        layout.addWidget(QLabel("Select a model:"))
-
-        model_combo = QComboBox()
-        models = [
-            ("openai/gpt-4o-mini", "OpenAI: GPT-4o mini"),
-            ("google/gemma-2-27b-it", "Google: Gemma 2 27B"),
-            ("qwen/qwen-2-72b-instruct", "Qwen 2 72B Instruct"),
-            ("deepseek/deepseek-coder", "DeepSeek Coder V2"),
-            ("meta-llama/llama-3-70b-instruct:nitro", "Meta: Llama 3 70B Instruct (Nitro)"),
-            ("anthropic/claude-3-haiku:beta", "Anthropic: Claude 3 Haiku"),
-            ("meta-llama/llama-3.1-405b-instruct", "Meta: Llama 3.1 405B Instruct"),
-            ("google/gemini-pro-1.5", "Google: Gemini Pro 1.5"),
-            ("openai/gpt-4o", "OpenAI: GPT-4o"),
-            ("anthropic/claude-3.5-sonnet", "Anthropic: Claude 3.5 Sonnet")
-        ]
-        model_combo.addItems([friendly for _, friendly in models])
-        layout.addWidget(model_combo)
-
-        layout.addWidget(QLabel("Enter your API Key:"))
+        layout.addWidget(QLabel("Please get the initial set up ready to proceed."))
+        layout.addWidget(QLabel("Enter your Straico API Key:"))
         api_key_input = QLineEdit()
         api_key_input.setEchoMode(QLineEdit.Password)
         layout.addWidget(api_key_input)
@@ -973,22 +1244,28 @@ class WovenSnipsGUI(QMainWindow):
 
         result = dialog.exec()
         if result == QDialog.Accepted:
-            selected_model = model_combo.currentText()
             api_key = api_key_input.text().strip()
-            if not selected_model or not api_key:
-                QMessageBox.warning(self, "Error", "Please select a model and enter an API Key.")
+            if not api_key:
+                QMessageBox.warning(self, "Error", "Please enter an API Key.")
                 return False
-            self.model = next(model_name for model_name, friendly in models if friendly == selected_model)
             self.api_key = api_key
             self.save_settings()
-            return True
+            self.update_models()
+            if self.available_models:
+                self.model = self.available_models[0][0]
+                self.save_settings()
+                return True
+            else:
+                QMessageBox.warning(self, "Error", "Unable to fetch available models. Please ensure that the API Key is in place or check the internet connection.")
+                return False
         return False
 
     def save_settings(self):
         settings = {
             'api_key': self.api_key,
             'model': self.model,
-            'dark_theme': self.current_theme == DARK_THEME
+            'dark_theme': self.current_theme == DARK_THEME,
+            'local_server': self.local_server.is_running()
         }
         with open('settings.json', 'w') as f:
             json.dump(settings, f)

@@ -6,11 +6,12 @@ WovenSnips is a lightweight, free, and open-source implementation of Retrieval-A
 ## Features 🌟
 
 - 🔍 Load and process corpora for exploration and context retrieval using Retrieval-Augmented Generation (RAG).
-- 🤖 Choose from a hand-picked selection of language models from among the several provided by Straico.
+- 🤖 Choose from a wide selection of LLMs provided by Straico.
 - 🪶 Designed lightweight to run on devices without a dedicated GPU.
 - 💾 Save and load vector stores for efficient reuse of processed corpora.
 - 📚 Support for various file formats (.pdf, .txt, .md, .csv).
 - 💬 Minimal, user-friendly interface for clutter-free, focused engagement with the loaded corpus.
+- 🔌Local server option to programmatically interact with other applications and scripts.
 - 🌓 Dark and light theme options.
 
 <div style="display: flex; justify-content: space-between;">
@@ -23,11 +24,12 @@ WovenSnips is a lightweight, free, and open-source implementation of Retrieval-A
 1. Download the latest release from the [Releases](https://github.com/ekjaisal/WovenSnips/releases) page.
 2. Set up WovenSnips on the local device using the installer (currently available only for Windows).
 3. Point and click to launch the application.
-4. Select the preferred model to interact with from **Settings → Set Model**.
-5. Set the Straico API Key from **Settings → Set API Key**. Existing Straico users can find their API Key from the platform's settings page. New users may choose to create a Straico account using this [referral link](https://platform.straico.com/signup?fpr=jaisal).
+4. Set the Straico API Key from **Settings → Set API Key**. Existing Straico users can find their API Key from the platform's settings page. New users may choose to create a Straico account using this [referral link](https://platform.straico.com/signup?fpr=jaisal).
+5. Select the preferred model to interact with from **Settings → Select Model**.
 6. Load the collection of files to be used as source material for RAG from **File → Load Corpus → Select Corpus Directory**, or load a previously saved vector store from **File → Load Vector Store**.
-7. Start interacting with the corpus through the chat interface.
+7. Start interacting with the corpus through the main interface.
 8. Save the loaded corpus as a vector store for future reuse from **File → Save Vector Store** to avoid reprocessing large corpora.
+9. Enable the local server from **Settings → Local Server** to allow [programmatic interaction](https://github.com/ekjaisal/WovenSnips/wiki).
 
 ## Third-Party Libraries and Services 🛠️
 
@@ -53,6 +55,6 @@ This tool is provided as-is, without any warranties. Users are responsible for e
 
 ## Acknowledgements 🤝🏾
 
-WovenSnips has benefitted significantly from the assistance of Anthropic's [Claude 3.5 Sonnet](https://www.anthropic.com/news/claude-3-5-sonnet) with all the heavy lifting associated with coding.
+WovenSnips has benefitted significantly from the assistance of Anthropic's [Claude 3.5 Sonnet](https://www.anthropic.com/news/claude-3-5-sonnet) with all the heavy lifting associated with coding, [Riley](https://github.com/RoboRiley)'s addition of local server capability, and the overwhelming warmth and support from the Straico community. 
 
 <a href="https://www.buymeacoffee.com/ekjaisal" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 40px !important;width: 160px !important;" ></a>
