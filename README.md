@@ -11,7 +11,7 @@ WovenSnips is a lightweight, free, and open-source implementation of Retrieval-A
 - 💾 Save and load vector stores for efficient reuse of processed corpora.
 - 📚 Support for various file formats (.pdf, .txt, .md, .csv).
 - 💬 Minimal, user-friendly interface for clutter-free, focused engagement with the loaded corpus.
-- 🔌Local server option to programmatically interact with other applications and scripts.
+- 🔌 Local server option to programmatically interact with other applications and scripts.
 - 🌓 Dark and light theme options.
 
 <div style="display: flex; justify-content: space-between;">
