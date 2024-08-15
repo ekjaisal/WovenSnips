@@ -30,8 +30,11 @@
 import os
 import sys
 import json
-import pickle
+import shutil
+import sqlite3
+import base64
 import logging
+import tempfile
 import threading
 from functools import lru_cache
 from urllib.parse import (urlparse, parse_qs)
@@ -39,14 +42,20 @@ from http.server import (HTTPServer, BaseHTTPRequestHandler)
 from concurrent.futures import (ThreadPoolExecutor, as_completed)
 from typing import (Optional, List, Any)
 
-import requests
+import faiss
 import torch
+import requests
+import msgpack
 import pdfplumber
+import numpy as np
 from pydantic import Field
 from langchain.llms.base import LLM
+from langchain.schema import Document
 from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from PySide6.QtCore import (Qt, Signal, QTimer, QRectF)
@@ -87,6 +96,17 @@ DARK_THEME = {
     QPalette.Mid: "#545454",
 }
 
+prompt_template = PromptTemplate(
+    template="""Rely solely on the provided context for accurate answers. If the context lacks the answer, respond with "I don't know." Except for terms and phrases, quote verbatim only when essential.
+
+Context: {context}
+
+Question: {question}
+
+Answer:""",
+    input_variables=["context", "question"]
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -121,6 +141,74 @@ class StraicoLLM(LLM):
     def _llm_type(self) -> str:
         return "straico"
 
+class TempDatabase:
+    def __init__(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, 'temp_corpus.db')
+        self.conn = sqlite3.connect(self.db_path)
+        self.cursor = self.conn.cursor()
+        self.setup_tables()
+
+    def setup_tables(self):
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT,
+                metadata TEXT
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS embeddings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER,
+                embedding BLOB,
+                FOREIGN KEY (document_id) REFERENCES documents (id)
+            )
+        ''')
+        self.conn.commit()
+
+    def add_document(self, content, metadata):
+        self.cursor.execute('INSERT INTO documents (content, metadata) VALUES (?, ?)',
+                            (content, json.dumps(metadata)))
+        return self.cursor.lastrowid
+
+    def add_embedding(self, document_id, embedding):
+        self.cursor.execute('INSERT INTO embeddings (document_id, embedding) VALUES (?, ?)',
+                            (document_id, embedding.tobytes()))
+
+    def get_document(self, doc_id):
+        self.cursor.execute('SELECT content, metadata FROM documents WHERE id = ?', (doc_id,))
+        content, metadata = self.cursor.fetchone()
+        return content, json.loads(metadata)
+
+    def get_all_documents(self):
+        self.cursor.execute('SELECT id, content, metadata FROM documents')
+        for row in self.cursor.fetchall():
+            yield row[0], row[1], json.loads(row[2])
+
+    def get_all_embeddings(self):
+        self.cursor.execute('SELECT id, embedding FROM embeddings')
+        return [(row[0], np.frombuffer(row[1], dtype=np.float32)) for row in self.cursor.fetchall()]
+
+    def iter_documents(self):
+        self.cursor.execute('SELECT content FROM documents')
+        for row in self.cursor.fetchall():
+            yield row[0].encode('utf-8')
+
+    def add_document_chunk(self, chunk):
+        self.cursor.execute('INSERT INTO documents (content) VALUES (?)', (chunk.decode('utf-8'),))
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+        shutil.rmtree(self.temp_dir)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
 @lru_cache(maxsize=100)
 def extract_text_from_file(file_path):
     try:
@@ -142,53 +230,103 @@ def extract_text_from_file(file_path):
         logger.error(f"Error extracting text from {file_path}: {e}")
         return None
 
-def process_files_in_batches(directory, batch_size=50):
+def process_files_in_batches(directory, temp_db, batch_size=50):
     supported_extensions = ['.pdf', '.txt', '.md', '.csv']
-    all_files = [f for f in os.listdir(directory) if os.path.splitext(f)[1].lower() in supported_extensions]
-    documents = []
+    all_files = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
     
-    with ThreadPoolExecutor() as executor:
-        future_to_file = {executor.submit(extract_text_from_file, os.path.join(directory, file)): file for file in all_files}
-        for future in as_completed(future_to_file):
-            result = future.result()
-            if result:
-                documents.append(result)
+    skipped_files = []
+    processed_files = []
     
-    return documents
+    for file in all_files:
+        file_path = os.path.join(directory, file)
+        file_extension = os.path.splitext(file_path)[1].lower()
+        
+        if file_extension not in supported_extensions:
+            skipped_files.append((file, "Unsupported file type"))
+            continue
+        
+        if file_extension == '.pdf':
+            result = process_pdf(file_path, temp_db)
+            if result == "empty":
+                skipped_files.append((file, "Empty or non-machine readable PDF"))
+            else:
+                processed_files.append(file)
+        elif file_extension in ['.txt', '.md', '.csv']:
+            process_text_file(file_path, temp_db, batch_size)
+            processed_files.append(file)
+    
+    return processed_files, skipped_files
+
+def process_pdf(file_path, temp_db):
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            if len(pdf.pages) == 0:
+                return "empty"
+            
+            content_found = False
+            for page_num, page in enumerate(pdf.pages):
+                text = page.extract_text() or ""
+                if text.strip():
+                    content_found = True
+                    metadata = {"source": file_path, "page": page_num + 1}
+                    temp_db.add_document(text, metadata)
+            
+            if not content_found:
+                return "empty"
+    except Exception as e:
+        logger.error(f"Error processing PDF {file_path}: {e}")
+        return "empty"
+
+def process_text_file(file_path, temp_db, batch_size):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        content = ""
+        for i, line in enumerate(file):
+            content += line
+            if (i + 1) % batch_size == 0:
+                metadata = {"source": file_path, "start_line": i - batch_size + 1, "end_line": i + 1}
+                temp_db.add_document(content, metadata)
+                content = ""
+        if content:
+            metadata = {"source": file_path, "start_line": i - len(content.splitlines()) + 1, "end_line": i + 1}
+            temp_db.add_document(content, metadata)
 
 def create_rag_system(directory, api_key, model):
-    documents = process_files_in_batches(directory)
-    
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"batch_size": 32}
-    )
-    
-    batch_size = 1000
-    all_splits = []
-    for i in range(0, len(documents), batch_size):
-        batch = documents[i:i+batch_size]
-        splits = text_splitter.create_documents(batch)
-        all_splits.extend(splits)
-    
-    db = FAISS.from_documents(all_splits, embeddings, normalize_L2=True)
-    
-    retriever = db.as_retriever(search_kwargs={"k": 3, "fetch_k": 5})
-    
-    straico_llm = StraicoLLM(api_key=api_key, model=model)
-    
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=straico_llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=False,
-        verbose=False
-    )
-    
-    return qa_chain, straico_llm, retriever
+    with TempDatabase() as temp_db:
+        processed_files, skipped_files = process_files_in_batches(directory, temp_db)
+        
+        if not processed_files:
+            raise ValueError("No valid files were processed. Please check your corpus.")
+        
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"batch_size": 32}
+        )
+        
+        documents = []
+        for doc_id, content, metadata in temp_db.get_all_documents():
+            doc = Document(page_content=content, metadata=metadata)
+            documents.append(doc)
+        
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        splits = text_splitter.split_documents(documents)
+        
+        db = FAISS.from_documents(splits, embeddings)
+        
+        retriever = db.as_retriever(search_kwargs={"k": 5, "fetch_k": 10})
+        
+        straico_llm = StraicoLLM(api_key=api_key, model=model)
+        
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=straico_llm,
+            chain_type="stuff",
+            retriever=retriever,
+            return_source_documents=False,
+            chain_type_kwargs={"prompt": prompt_template},
+            verbose=False
+        )
+        
+        return qa_chain, straico_llm, retriever, skipped_files
 
 class DocumentLoader(threading.Thread):
     def __init__(self, directory, api_key, model):
@@ -238,20 +376,99 @@ class SpinningLoader(QWidget):
         self.timer.stop()
         self.hide()
 
-class ChatWorker(threading.Thread):
-    def __init__(self, qa_system, query):
-        super().__init__()
-        self.qa_system = qa_system
-        self.query = query
-        self.result = None
-        self.error = None
+class WovenSnipsSerializer:
+    @classmethod
+    def serialize(cls, obj):
+        if isinstance(obj, FAISS):
+            return msgpack.packb({
+                'type': 'FAISS',
+                'index': cls.serialize_faiss_index(obj.index),
+                'docstore': cls.serialize_docstore(obj.docstore._dict),
+                'embedding_function': cls.serialize_embedding_function(obj.embedding_function),
+                'index_to_docstore_id': {str(k): v for k, v in obj.index_to_docstore_id.items()}
+            })
+        return msgpack.packb(obj)
 
-    def run(self):
-        try:
-            response = self.qa_system.invoke({"query": self.query})
-            self.result = response["result"]
-        except Exception as e:
-            self.error = str(e)
+    @classmethod
+    def deserialize(cls, data):
+        unpacked = msgpack.unpackb(data)
+        if isinstance(unpacked, dict) and 'type' in unpacked and unpacked['type'] == 'FAISS':
+            index = cls.deserialize_faiss_index(unpacked['index'])
+            docstore = cls.deserialize_docstore(unpacked['docstore'])
+            embedding_function = cls.deserialize_embedding_function(unpacked['embedding_function'])
+            index_to_docstore_id = {int(k): v for k, v in unpacked['index_to_docstore_id'].items()}
+            
+            return FAISS(
+                embedding_function=embedding_function,
+                index=index,
+                docstore=InMemoryDocstore(docstore),
+                index_to_docstore_id=index_to_docstore_id
+            )
+        return unpacked
+
+    @classmethod
+    def serialize_faiss_index(cls, index):
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            faiss.write_index(index, temp_file.name)
+            temp_file.flush()
+            with open(temp_file.name, 'rb') as f:
+                serialized = base64.b64encode(f.read()).decode()
+        os.unlink(temp_file.name)
+        return serialized
+
+    @classmethod
+    def deserialize_faiss_index(cls, index_data):
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(base64.b64decode(index_data))
+            temp_file.flush()
+            index = faiss.read_index(temp_file.name)
+        os.unlink(temp_file.name)
+        return index
+
+    @classmethod
+    def serialize_docstore(cls, docstore):
+        return {k: cls.serialize_document(v) for k, v in docstore.items()}
+
+    @classmethod
+    def deserialize_docstore(cls, docstore):
+        return {k: cls.deserialize_document(v) for k, v in docstore.items()}
+
+    @classmethod
+    def serialize_document(cls, doc):
+        return {
+            'page_content': doc.page_content,
+            'metadata': doc.metadata
+        }
+
+    @classmethod
+    def deserialize_document(cls, doc_dict):
+        return Document(
+            page_content=doc_dict['page_content'],
+            metadata=doc_dict['metadata']
+        )
+
+    @classmethod
+    def serialize_embedding_function(cls, embedding_function):
+        if isinstance(embedding_function, HuggingFaceEmbeddings):
+            return {
+                'type': 'HuggingFaceEmbeddings',
+                'model_name': embedding_function.model_name,
+                'model_kwargs': embedding_function.model_kwargs,
+                'encode_kwargs': embedding_function.encode_kwargs
+            }
+        else:
+            raise ValueError(f"Unsupported embedding function type: {type(embedding_function)}")
+
+    @classmethod
+    def deserialize_embedding_function(cls, data):
+        if data['type'] == 'HuggingFaceEmbeddings':
+            return HuggingFaceEmbeddings(
+                model_name=data['model_name'],
+                model_kwargs=data['model_kwargs'],
+                encode_kwargs=data['encode_kwargs']
+            )
+        else:
+            raise ValueError(f"Unsupported embedding function type: {data['type']}")
 
 class SaveVectorStoreWorker(threading.Thread):
     def __init__(self, retriever, file_path):
@@ -263,8 +480,9 @@ class SaveVectorStoreWorker(threading.Thread):
 
     def run(self):
         try:
+            serialized_data = WovenSnipsSerializer.serialize(self.retriever.vectorstore)
             with open(self.file_path, 'wb') as f:
-                pickle.dump(self.retriever.vectorstore, f)
+                f.write(serialized_data)
             self.success = True
         except Exception as e:
             self.error = str(e)
@@ -279,7 +497,23 @@ class LoadVectorStoreWorker(threading.Thread):
     def run(self):
         try:
             with open(self.file_path, 'rb') as f:
-                self.result = pickle.load(f)
+                serialized_data = f.read()
+            self.result = WovenSnipsSerializer.deserialize(serialized_data)
+        except Exception as e:
+            self.error = str(e)
+
+class ChatWorker(threading.Thread):
+    def __init__(self, qa_system, query):
+        super().__init__()
+        self.qa_system = qa_system
+        self.query = query
+        self.result = None
+        self.error = None
+
+    def run(self):
+        try:
+            response = self.qa_system.invoke({"query": self.query})
+            self.result = response["result"]
         except Exception as e:
             self.error = str(e)
 
@@ -405,7 +639,8 @@ class WovenSnipsLocalServer:
                         elif prompt == "clear_session":
                             response = self.server.woven_snips.clear_session_local_server()
                         else:
-                            response = self.server.woven_snips.process_chat(prompt)                        
+                            response = self.server.woven_snips.process_chat(prompt)
+                        
                         self.send_response(200)
                         self.send_header('Content-type', 'application/json')
                         self.end_headers()
@@ -512,13 +747,13 @@ class WovenSnipsGUI(QMainWindow):
         load_docs_action.triggered.connect(self.load_documents)
         file_menu.addAction(load_docs_action)
         
-        save_pkl_action = QAction("Save Vector Store", self)
-        save_pkl_action.triggered.connect(self.save_vector_store)
-        file_menu.addAction(save_pkl_action)
+        save_vs_action = QAction("Save Vector Store", self)
+        save_vs_action.triggered.connect(self.save_vector_store)
+        file_menu.addAction(save_vs_action)
 
-        load_pkl_action = QAction("Load Vector Store", self)
-        load_pkl_action.triggered.connect(self.load_vector_store)
-        file_menu.addAction(load_pkl_action)
+        load_vs_action = QAction("Load Vector Store", self)
+        load_vs_action.triggered.connect(self.load_vector_store)
+        file_menu.addAction(load_vs_action)
         
         self.clear_session_action = QAction("Clear Session", self)
         self.clear_session_action.triggered.connect(self.clear_session_gui)
@@ -574,15 +809,25 @@ class WovenSnipsGUI(QMainWindow):
                 self.on_documents_loaded(self.loader.result)
 
     def on_documents_loaded(self, result):
-        self.qa_system, self.straico_llm, self.retriever = result
+        self.qa_system, self.straico_llm, self.retriever, skipped_files = result
         self.loader_widget.stop()
         self.chat_widget.add_message("Corpus loaded successfully.", False)
+        
+        if skipped_files:
+            skipped_files_message = self.format_skipped_files_message(skipped_files)
+            self.chat_widget.add_message(skipped_files_message, False)
         
         reply = QMessageBox.question(self, 'Save Vector Store', 
                                      "Do you want to save the vector store for future use?",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if reply == QMessageBox.Yes:
             self.save_vector_store()
+
+    def format_skipped_files_message(self, skipped_files):
+        message = "The following files were skipped:\n\n"
+        for file, reason in skipped_files:
+            message += f"{file}: {reason}\n"
+        return message
 
     def on_loading_error(self, error):
         self.loader_widget.stop()
@@ -593,8 +838,10 @@ class WovenSnipsGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "No vector store to save. Please load a corpus or vector store first.")
             return
 
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Vector Store", "", "Pickle Files (*.pkl)")
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Vector Store", "", "WovenSnips Files (*.wov)")
         if file_path:
+            if not file_path.endswith('.wov'):
+                file_path += '.wov'
             self.loader_widget.start()
             self.save_worker = SaveVectorStoreWorker(self.retriever, file_path)
             self.save_worker.start()
@@ -618,7 +865,7 @@ class WovenSnipsGUI(QMainWindow):
         self.chat_widget.add_message(f"Error: Failed to save vector store - {error}", False)
 
     def load_vector_store(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Load Vector Store", "", "Pickle Files (*.pkl)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Vector Store", "", "WovenSnips Files (*.wov)")
         if file_path:
             self.loader_widget.start()
             self.load_worker = LoadVectorStoreWorker(file_path)
@@ -636,7 +883,8 @@ class WovenSnipsGUI(QMainWindow):
             
     def on_vector_store_loaded(self, vectorstore):
         self.loader_widget.stop()
-        self.retriever = vectorstore.as_retriever(search_kwargs={"k": 3, "fetch_k": 5})
+        self.retriever = vectorstore.as_retriever(search_kwargs={"k": 5, "fetch_k": 10})
+        self.straico_llm = StraicoLLM(api_key=self.api_key, model=self.model)
         self.recreate_qa_system()
         self.chat_widget.add_message("Vector store loaded successfully.", False)
 
@@ -730,6 +978,9 @@ class WovenSnipsGUI(QMainWindow):
         if not self.api_key:
             return json.dumps({"response": "Error: API Key is not set. Please set the API Key in the application settings.", "status": 401})
 
+        if not self.model:
+            return json.dumps({"response": "Error: Model is not selected. Please select a model.", "status": 400})
+
         if prompt.startswith("load_corpus:"):
             directory = prompt[12:].strip()
             return self.load_corpus_local_server(directory)
@@ -767,11 +1018,44 @@ class WovenSnipsGUI(QMainWindow):
             return json.dumps({"response": f"Error: Directory not found - {directory}", "status": 400})
 
         try:
-            qa_system, straico_llm, retriever = create_rag_system(directory, self.api_key, self.model)
-            self.qa_system, self.straico_llm, self.retriever = qa_system, straico_llm, retriever
-            return json.dumps({"response": f"Corpus loaded successfully from {directory}", "status": 200})
+            self.loader = DocumentLoader(directory, self.api_key, self.model)
+            self.loader.start()
+            self.loader.join()
+
+            if self.loader.error:
+                return json.dumps({"response": f"Error loading corpus: {self.loader.error}", "status": 400})
+
+            self.qa_system, self.straico_llm, self.retriever, skipped_files = self.loader.result
+            
+            response = f"Corpus loaded successfully from {directory}"
+            if skipped_files:
+                response += "\n\n" + self.format_skipped_files_message(skipped_files)
+            
+            return json.dumps({"response": response, "status": 200})
         except Exception as e:
             return json.dumps({"response": f"Error loading corpus: {str(e)}", "status": 400})
+
+    def save_vector_store_local_server(self, file_path):
+        if not self.api_key:
+            return json.dumps({"response": "Error: API Key is not set. Please set the API Key in the application settings.", "status": 401})
+
+        if not self.retriever:
+            return json.dumps({"response": "Error: No vector store to save. Please load a corpus or vector store first.", "status": 400})
+
+        try:
+            if not file_path.endswith('.wov'):
+                file_path += '.wov'
+            save_worker = SaveVectorStoreWorker(self.retriever, file_path)
+            save_worker.start()
+            save_worker.join()
+
+            if save_worker.error:
+                return json.dumps({"response": f"Error saving vector store: {save_worker.error}", "status": 400})
+
+            return json.dumps({"response": f"Vector store saved to {file_path}", "status": 200})
+        except Exception as e:
+            logger.error(f"Error saving vector store: {str(e)}")
+            return json.dumps({"response": f"Error saving vector store: {str(e)}", "status": 400})
 
     def load_vector_store_local_server(self, file_path):
         if not self.api_key:
@@ -781,28 +1065,26 @@ class WovenSnipsGUI(QMainWindow):
             return json.dumps({"response": f"Error: File not found - {file_path}", "status": 400})
 
         try:
-            with open(file_path, 'rb') as f:
-                vectorstore = pickle.load(f)
-            self.retriever = vectorstore.as_retriever(search_kwargs={"k": 3, "fetch_k": 5})
+            load_worker = LoadVectorStoreWorker(file_path)
+            load_worker.start()
+            load_worker.join()
+
+            if load_worker.error:
+                return json.dumps({"response": f"Error loading vector store: {load_worker.error}", "status": 400})
+
+            vectorstore = load_worker.result
+            
+            if not isinstance(vectorstore, FAISS):
+                raise ValueError(f"Loaded object is not a FAISS instance. Got {type(vectorstore)}")
+            
+            self.retriever = vectorstore.as_retriever(search_kwargs={"k": 5, "fetch_k": 10})
             self.recreate_qa_system()
             return json.dumps({"response": f"Vector store loaded successfully from {file_path}", "status": 200})
         except Exception as e:
-            return json.dumps({"response": f"Error loading vector store: {str(e)}", "status": 400})
-            
-    def save_vector_store_local_server(self, file_path):
-        if not self.api_key:
-            return json.dumps({"response": "Error: API Key is not set. Please set the API Key in the application settings.", "status": 401})
-
-        if not self.retriever:
-            return json.dumps({"response": "Error: No vector store to save. Please load a corpus or vector store first.", "status": 400})
-
-        try:
-            with open(file_path, 'wb') as f:
-                pickle.dump(self.retriever.vectorstore, f)
-            return json.dumps({"response": f"Vector store saved to {file_path}", "status": 200})
-        except Exception as e:
-            return json.dumps({"response": f"Error saving vector store: {str(e)}", "status": 400})
-            
+            error_msg = f"Error loading vector store: {str(e)}"
+            logger.error(error_msg)
+            return json.dumps({"response": error_msg, "status": 400})
+                        
     def list_models_local_server(self):
         if not self.api_key:
             return json.dumps({"response": "Error: API Key is not set. Please set the API Key in the application settings.", "status": 401})
@@ -927,7 +1209,8 @@ class WovenSnipsGUI(QMainWindow):
                 llm=self.straico_llm,
                 chain_type="stuff",
                 retriever=self.retriever,
-                return_source_documents=False
+                return_source_documents=False,
+                chain_type_kwargs={"prompt": prompt_template}
             )
         else:
             QMessageBox.warning(self, "Warning", "Please load a corpus or vector store.")
@@ -1067,13 +1350,13 @@ class WovenSnipsGUI(QMainWindow):
         <h3>Load Corpus</h3>
         <p>Load the collection of files to be used as source material for Retrieval-Augmented Generation from <strong>File → Load Corpus → Select Corpus Directory</strong>. WovenSnips currently supports files with the following extensions to be included in the corpus directory: <code>.pdf</code>, <code>.txt</code>, <code>.md</code>, <code>.csv</code></p>
         <hr />
-        <h3>Pickling and Unpickling of Vector Stores</h3>
-        <p>WovenSnips allows users to save a loaded corpus as a vector store for future reuse by pickling it in <code>.pkl</code> format from <strong>File → Save Vector Store</strong>. Users can unpickle it from <strong>File → Load Vector Store → your_file.pkl</strong> for reuse. Loading a pickled vector store would significantly save initial processing time and resources compared to loading the corpora every time from scratch.</p>
-        <p><em><strong>Note:</strong> WovenSnips vector stores have a minimum pickled size of 75-90 MB. The increase from the baseline is commensurate with the corpus size.</em></p>
+        <h3>Save and Load Vector Store</h3>
+        <p>WovenSnips allows users to save the loaded corpus as vector store for future reuse by serialising it in <code>.wov</code> format from <strong>File → Save Vector Store</strong>. Users can load it from <strong>File → Load Vector Store → your_file.wov</strong> for reuse. Loading frequently used corpora from vector stores would significantly save initial processing time and resources compared to loading it every time from scratch.</p>
+        <p><em><strong>Note:</strong> Load vector stores only from trusted and verified sources to ensure security and integrity.</em></p>
         <hr />
         <h3>Clear Session</h3>
         <p>Start a fresh session of interaction by clearing the loaded corpus and vector files from <strong>File → Clear Session</strong>.</p>
-        <p><em><strong>Note:</strong> The API Key, model, and theme preferences persist across sessions and remain unaffected on clearing sessions or application relaunch. Users can manually remove the API Key or change the model and theme preferences from Settings.</em></p>
+        <p><em><strong>Note:</strong> The API Key, model and theme preferences, and local server status persist across sessions and remain unaffected on clearing sessions or application relaunch. Users can manually remove the API Key, change the model and theme preferences, and local server status from Settings.</em></p>
         <hr />
         <h3>Themes</h3>
         <p>WovenSnips supports light (default) and dark themes. Toggle the dark theme on/off from <strong>Settings → Dark Theme</strong>.</p>
@@ -1086,7 +1369,7 @@ class WovenSnipsGUI(QMainWindow):
 
     def show_about(self):
         about_html = """
-        <h2>WovenSnips <small>v1.0.1</small></h2>        
+        <h2>WovenSnips <small>v1.1.0</small></h2>
         <p>A Lightweight, Free, and Open-source Implementation of Retrieval-Augmented Generation (RAG) using Straico API</p>
         <hr>        
         <h3>License</h3>        
@@ -1121,12 +1404,14 @@ class WovenSnipsGUI(QMainWindow):
         <li><a href="https://straico.com">Straico</a> via API (<a href="https://documenter.getpostman.com/view/5900072/2s9YyzddrR">Documentation</a>)</li>
         <li><a href="https://pypi.org/project/PySide6">PySide6</a> (LGPL License)</li>
         <li><a href="https://github.com/pytorch/pytorch">PyTorch</a> (BSD-3-Clause License)</li>
+        <li><a href="https://github.com/numpy/numpy">NumPy</a> (BSD-3-Clause License)</li>
         <li><a href="https://pypi.org/project/langchain">Langchain</a> (MIT License)</li>
         <li><a href="https://pypi.org/project/langchain-community">LangChain Community</a> (MIT License)</li>
         <li><a href="https://pypi.org/project/langchain-huggingface">Langchain Hugging Face</a> (MIT License)</li>
         <li><a href="https://github.com/kyamagu/faiss-wheels">FAISS-CPU</a> (MIT License)</li>
         <li><a href="https://github.com/pydantic/pydantic">Pydantic</a> (MIT License)</li>
         <li><a href="https://github.com/jsvine/pdfplumber">pdfplumber</a> (MIT License)</li>
+        <li><a href="https://github.com/msgpack/msgpack-python">MessagePack</a> (Apache License, Version 2.0)</li>
         <li><a href="https://github.com/psf/requests">Requests</a> (Apache License, Version 2.0)</li>
         <li><a href="https://fonts.google.com/specimen/Roboto">Roboto Font</a> (Apache License, Version 2.0)</li>
         <li><a href="https://pyinstaller.org">PyInstaller</a> (GPL 2.0 License, with an Exception)</li>

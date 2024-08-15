@@ -37,9 +37,10 @@ WovenSnips is built using [Python 3.11.9](https://www.python.org/downloads/relea
 
 - [Straico API](https://straico.com) for language model integration,
 - [PySide6](https://pypi.org/project/PySide6) for the graphical user interface,
-- [PyTorch](https://github.com/pytorch/pytorch), [Langchain](https://pypi.org/project/langchain), [Langchain Community](https://pypi.org/project/langchain-community), [Langchain Hugging Face](https://pypi.org/project/langchain-huggingface), and [FAISS-CPU](https://github.com/kyamagu/faiss-wheels) for RAG implementation,
+- [PyTorch](https://github.com/pytorch/pytorch), [NumPy](https://github.com/numpy/numpy), [Langchain](https://pypi.org/project/langchain), [Langchain Community](https://pypi.org/project/langchain-community), [Langchain Hugging Face](https://pypi.org/project/langchain-huggingface), and [FAISS-CPU](https://github.com/kyamagu/faiss-wheels) for RAG implementation,
 - [Pydantic](https://github.com/pydantic/pydantic) for data validation,
 - [pdfplumber](https://github.com/jsvine/pdfplumber) for processing PDFs,
+- [MessagePack](https://github.com/msgpack/msgpack-python) for vector store serialisation,
 - [Requests](https://github.com/psf/requests) for API communication,
 - [Roboto Font](https://fonts.google.com/specimen/Roboto) for UI typography,
 - [PyInstaller](https://pyinstaller.org/) for creating standalone executables, and
