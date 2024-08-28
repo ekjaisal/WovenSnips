@@ -1,3 +1,6 @@
+---
+---
+
 @import "{{ site.theme }}";
 
 body {
@@ -26,36 +29,34 @@ pre code {
 }
 
 .btn {
-  color: #F5F3EF;
-  background-color: #66023C;
-  border: 2px solid #141414;
-  font-family: 'Roboto', sans-serif;
-  height: 30px;
-  padding: 0 15px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  border-radius: 0;
-  font-size: 1rem;
-  line-height: 1.5;
-  transition: color 0.15s ease-in-out, background-color 0.15s ease-in-out, border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
-  margin-right: 10px;
-  margin-bottom: 10px;
-  text-decoration: none;
-  cursor: pointer;
+  color: #F5F3EF !important;
+  background-color: #66023C !important;
+  border: 2px solid #141414 !important;
+  font-family: 'Roboto', sans-serif !important;
+  height: auto !important;
+  padding: 10px 15px !important;
+  display: inline-block !important;
+  text-align: center !important;
+  border-radius: 0 !important;
+  font-size: 1rem !important;
+  line-height: 1.5 !important;
+  transition: all 0.15s ease-in-out !important;
+  margin: 0 10px 10px 0 !important;
+  text-decoration: none !important;
+  cursor: pointer !important;
+  white-space: nowrap !important;
 
-  &:hover {
-    color: #F5F3EF;
-    background-color: #8C0352;
-    border-color: #141414;
-    text-decoration: none;
+  &:hover, &:focus {
+    color: #F5F3EF !important;
+    background-color: #8C0352 !important;
+    border-color: #141414 !important;
+    text-decoration: none !important;
   }
 
   &:active {
-    color: #F5F3EF;
-    background-color: #4D0129;
-    border-color: #141414;
+    color: #F5F3EF !important;
+    background-color: #4D0129 !important;
+    border-color: #141414 !important;
   }
 }
 
