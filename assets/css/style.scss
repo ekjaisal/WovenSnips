@@ -11,6 +11,10 @@ body {
 
 a {
   color: #66023C;
+
+  &:hover {
+    color: #8C0352;
+  }
 }
 
 code {
@@ -29,34 +33,20 @@ pre code {
 }
 
 .btn {
-  color: #F5F3EF !important;
-  background-color: #66023C !important;
-  border: 2px solid #141414 !important;
-  font-family: 'Roboto', sans-serif !important;
-  height: auto !important;
-  padding: 10px 15px !important;
-  display: inline-block !important;
-  text-align: center !important;
-  border-radius: 0 !important;
-  font-size: 1rem !important;
-  line-height: 1.5 !important;
-  transition: all 0.15s ease-in-out !important;
-  margin: 0 10px 10px 0 !important;
-  text-decoration: none !important;
-  cursor: pointer !important;
-  white-space: nowrap !important;
+  color: #F5F3EF;
+  background-color: #66023C;
+  border-color: #66023C;
 
-  &:hover, &:focus {
-    color: #F5F3EF !important;
-    background-color: #8C0352 !important;
-    border-color: #141414 !important;
-    text-decoration: none !important;
+  &:hover {
+    color: #F5F3EF;
+    background-color: #8C0352;
+    border-color: #8C0352;
   }
 
   &:active {
-    color: #F5F3EF !important;
-    background-color: #4D0129 !important;
-    border-color: #141414 !important;
+    color: #F5F3EF;
+    background-color: #4D0129;
+    border-color: #4D0129;
   }
 }
 
