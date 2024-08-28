@@ -42,31 +42,34 @@ pre code {
   transition: color 0.15s ease-in-out, background-color 0.15s ease-in-out, border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
   margin-right: 10px;
   margin-bottom: 10px;
-}
+  text-decoration: none;
+  cursor: pointer;
 
-.btn:hover {
-  color: #F5F3EF;
-  background-color: #8C0352;
-  border-color: #141414;
-}
+  &:hover {
+    color: #F5F3EF;
+    background-color: #8C0352;
+    border-color: #141414;
+    text-decoration: none;
+  }
 
-.btn:active {
-  color: #F5F3EF;
-  background-color: #4D0129;
-  border-color: #141414;
+  &:active {
+    color: #F5F3EF;
+    background-color: #4D0129;
+    border-color: #141414;
+  }
 }
 
 header {
   text-align: center;
-}
 
-header img {
-  width: 80px;
-  display: inline-block;
+  img {
+    width: 80px;
+    display: inline-block;
+  }
 }
 
 section img[src$=".jpg"] {
   border: 1px solid #141414;
-  border-radius: 0px;
-  padding: 0px;
+  border-radius: 0;
+  padding: 0;
 }
